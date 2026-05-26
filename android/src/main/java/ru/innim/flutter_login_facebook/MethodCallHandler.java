@@ -1,10 +1,14 @@
 package ru.innim.flutter_login_facebook;
 
 import android.app.Activity;
+import android.content.Context;
 import android.net.Uri;
 import android.os.Bundle;
 
+import androidx.activity.result.ActivityResultRegistryOwner;
+
 import com.facebook.AccessToken;
+import com.facebook.CallbackManager;
 import com.facebook.FacebookRequestError;
 import com.facebook.FacebookSdk;
 import com.facebook.GraphRequest;
@@ -38,77 +42,164 @@ public class MethodCallHandler implements MethodChannel.MethodCallHandler {
 
     private final LoginCallback _loginCallback;
     private Activity _activity;
+    private Context _applicationContext;
+    private ActivityProvider _activityProvider;
+    private LoginHost _loginHost;
+
+    interface ActivityProvider {
+        Activity getActivity();
+    }
+
+    interface LoginHost {
+        void ensureCallbacksRegistered();
+
+        CallbackManager getCallbackManager();
+    }
 
     public MethodCallHandler(LoginCallback loginCallback) {
         _loginCallback = loginCallback;
+    }
+
+    public void setActivityProvider(ActivityProvider activityProvider) {
+        _activityProvider = activityProvider;
+    }
+
+    public void setLoginHost(LoginHost loginHost) {
+        _loginHost = loginHost;
     }
 
     public void updateActivity(Activity activity) {
         _activity = activity;
     }
 
-    private void ensureFacebookSdkInitialized() {
-        if (!FacebookSdk.isInitialized()) {
-            FacebookSdk.setAutoInitEnabled(true);
-            FacebookSdk.fullyInitialize();
+    public void updateApplicationContext(Context applicationContext) {
+        _applicationContext = applicationContext.getApplicationContext();
+    }
+
+    private Context getApplicationContext() {
+        final Activity activity = getActivity();
+        if (activity != null) {
+            return activity.getApplicationContext();
         }
+        return _applicationContext;
+    }
+
+    private Activity getActivity() {
+        if (_activity != null) {
+            return _activity;
+        }
+        if (_activityProvider != null) {
+            return _activityProvider.getActivity();
+        }
+        return null;
+    }
+
+    private void ensureFacebookSdkInitialized() {
+        if (FacebookSdk.isInitialized()) {
+            return;
+        }
+
+        final Context context = getApplicationContext();
+        if (context == null) {
+            throw new IllegalStateException("Application context is not available");
+        }
+
+        FacebookSdk.setAutoInitEnabled(true);
+        FacebookSdk.sdkInitialize(context);
     }
 
     @Override
     public void onMethodCall(MethodCall call, Result result) {
-        if (_activity != null) {
-            switch (call.method) {
-                case _IS_READY_METHOD:
-                    isReady(result);
-                    break;
-                case _LOGIN_METHOD:
-                    final List<String> permissions = call.argument(_PERMISSIONS_ARG);
-                    logIn(permissions, result);
-                    break;
-                case _EXPRESS_LOGIN_METHOD:
-                    expressLogin(result);
-                    break;
-                case _LOGOUT_METHOD:
-                    logOut(result);
-                    break;
-                case _GET_ACCESS_TOKEN:
-                    getAccessToken(result);
-                    break;
-                case _GET_USER_PROFILE:
-                    getUserProfile(result);
-                    break;
-                case _GET_SDK_VERSION:
-                    getSdkVersion(result);
-                    break;
-                case _GET_USER_EMAIL:
-                    getUserEmail(result);
-                    break;
-                case _GET_PROFILE_IMAGE_URL:
-                    final Integer width = call.argument(_WIDTH_ARG);
-                    final Integer height = call.argument(_HEIGHT_ARG);
+        if (_IS_READY_METHOD.equals(call.method)) {
+            isReady(result);
+            return;
+        }
 
-                    if (width != null && height != null ) {
-                        getProfileImageUrl(result, width, height);
-                    } else {
-                        result.error(ErrorCode.INVALID_ARGS, "Some of args is invalid", null);
-                    }
-                    break;
-                default:
-                    result.notImplemented();
-                    break;
-            }
+        switch (call.method) {
+            case _LOGOUT_METHOD:
+                logOut(result);
+                return;
+            case _GET_ACCESS_TOKEN:
+                getAccessToken(result);
+                return;
+            case _GET_USER_PROFILE:
+                getUserProfile(result);
+                return;
+            case _GET_SDK_VERSION:
+                getSdkVersion(result);
+                return;
+            case _GET_USER_EMAIL:
+                getUserEmail(result);
+                return;
+            case _GET_PROFILE_IMAGE_URL:
+                final Integer width = call.argument(_WIDTH_ARG);
+                final Integer height = call.argument(_HEIGHT_ARG);
+
+                if (width != null && height != null ) {
+                    getProfileImageUrl(result, width, height);
+                } else {
+                    result.error(ErrorCode.INVALID_ARGS, "Some of args is invalid", null);
+                }
+                return;
+        }
+
+        if (getActivity() == null) {
+            result.error(ErrorCode.FAILED, "Activity is not available", null);
+            return;
+        }
+
+        switch (call.method) {
+            case _LOGIN_METHOD:
+                final List<String> permissions = call.argument(_PERMISSIONS_ARG);
+                logIn(permissions, result);
+                break;
+            case _EXPRESS_LOGIN_METHOD:
+                expressLogin(result);
+                break;
+            default:
+                result.notImplemented();
+                break;
         }
     }
 
     private void logIn(List<String> permissions, Result result) {
-        ensureFacebookSdkInitialized();
-        _loginCallback.addPending(result);
-        LoginManager.getInstance().logIn(_activity, permissions);
+        final Activity activity = getActivity();
+        if (activity == null) {
+            result.error(ErrorCode.FAILED, "Activity is not available", null);
+            return;
+        }
+
+        try {
+            ensureFacebookSdkInitialized();
+            if (_loginHost != null) {
+                _loginHost.ensureCallbacksRegistered();
+            }
+            _loginCallback.addPending(result);
+
+            if (_loginHost != null && activity instanceof ActivityResultRegistryOwner) {
+                LoginManager.getInstance().logIn(
+                        (ActivityResultRegistryOwner) activity,
+                        _loginHost.getCallbackManager(),
+                        permissions
+                );
+            } else {
+                LoginManager.getInstance().logIn(activity, permissions);
+            }
+        } catch (Exception e) {
+            result.error(ErrorCode.FAILED, e.getMessage(), null);
+        }
     }
 
     private void expressLogin(final Result result) {
-        ensureFacebookSdkInitialized();
-        LoginManager.getInstance().retrieveLoginStatus(_activity.getApplicationContext(), new LoginStatusCallback() {
+        final Activity activity = getActivity();
+        if (activity == null) {
+            result.error(ErrorCode.FAILED, "Activity is not available", null);
+            return;
+        }
+
+        try {
+            ensureFacebookSdkInitialized();
+            LoginManager.getInstance().retrieveLoginStatus(activity.getApplicationContext(), new LoginStatusCallback() {
             @Override
             public void onCompleted(AccessToken token) {
                 result.success(Results.loginSuccess(token));
@@ -122,12 +213,23 @@ public class MethodCallHandler implements MethodChannel.MethodCallHandler {
                 result.error(ErrorCode.FAILED, e.getMessage(), null);
             }
         });
+        } catch (Exception e) {
+            result.error(ErrorCode.FAILED, e.getMessage(), null);
+        }
     }
 
     private void logOut(Result result) {
-        ensureFacebookSdkInitialized();
-        LoginManager.getInstance().logOut();
-        result.success(null);
+        try {
+            if (!FacebookSdk.isInitialized()) {
+                result.success(null);
+                return;
+            }
+            ensureFacebookSdkInitialized();
+            LoginManager.getInstance().logOut();
+            result.success(null);
+        } catch (Exception e) {
+            result.error(ErrorCode.FAILED, e.getMessage(), null);
+        }
     }
 
     private void getAccessToken(Result result) {
